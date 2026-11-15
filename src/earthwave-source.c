@@ -46,7 +46,7 @@ struct ew {
 	/* settings */
 	char *audio_name;
 	int style, range;
-	bool mirror, gradient, gradient3, bg_on, peaks;
+	bool mirror, gradient, gradient3, bg_on, peaks, baseline;
 	uint32_t color, color2, color3, bg;
 	int width, height, bars, gap, px, layers, font, sine_count, sine_thick;
 	float scale, sens, smooth, decay, sine_speed, sine_size;
@@ -630,12 +630,13 @@ static void ew_draw_bars(struct ew *e, float W, float H, bool linear)
 
 		int n = (int)roundf(e->val[i] * (float)(rows - 2));
 		if (n < 1)
-			n = 1;
+			n = e->baseline ? 1 : 0;
 		int solid = (int)roundf((float)n * 0.4f);
 		if (solid < 1)
 			solid = 1;
 
-		ew_rect(e, x, H - (float)solid * px, w, (float)solid * px, base);
+		if (n > 0)
+			ew_rect(e, x, H - (float)solid * px, w, (float)solid * px, base);
 
 		for (int r = solid; r < n; r++) {
 			const float t = (float)r / (float)n;
@@ -691,7 +692,7 @@ static void ew_draw_solid(struct ew *e, float W, float H, bool linear)
 			w = 1.0f;
 		float h = roundf(e->val[i] * (H - 4.0f));
 		if (h < 2.0f)
-			h = 2.0f;
+			h = e->baseline ? 2.0f : 0.0f;
 		if (e->trails > 0.0f) {
 			const float th = roundf(e->trail[i] * (H - 4.0f));
 			if (th > h)
@@ -722,7 +723,7 @@ static void ew_draw_center(struct ew *e, float W, float H, bool linear)
 			w = 1.0f;
 		float h = roundf(e->val[i] * (mid - 1.0f));
 		if (h < 1.0f)
-			h = 1.0f;
+			h = e->baseline ? 1.0f : 0.0f;
 		if (e->trails > 0.0f) {
 			const float th = roundf(e->trail[i] * (mid - 1.0f));
 			if (th > h) {
@@ -1002,6 +1003,7 @@ static bool ew_style_changed(obs_properties_t *props, obs_property_t *property, 
 	ew_show(props, "gap", bars);
 	ew_show(props, "px", style == STYLE_BARS);
 	ew_show(props, "peaks", style == STYLE_BARS || style == STYLE_SOLID);
+	ew_show(props, "baseline", bars);
 	ew_show(props, "layers", style == STYLE_SCOPE);
 	ew_show(props, "font", style == STYLE_ASCII);
 	ew_show(props, "sine_count", style == STYLE_SINES);
@@ -1063,6 +1065,7 @@ static obs_properties_t *ew_properties(void *data)
 	obs_properties_add_int_slider(props, "gap", "Gap", 0, 12, 1);
 	obs_properties_add_int_slider(props, "px", "Pixel Size", 1, 10, 1);
 	obs_properties_add_bool(props, "peaks", "Peak Dashes");
+	obs_properties_add_bool(props, "baseline", "Show Baseline When Silent");
 
 	obs_properties_add_int_slider(props, "layers", "Scope Layers", 1, 12, 1);
 	obs_properties_add_int_slider(props, "font", "ASCII Size", 8, 48, 1);
@@ -1104,6 +1107,7 @@ static void ew_defaults(obs_data_t *s)
 	obs_data_set_default_int(s, "gap", 2);
 	obs_data_set_default_int(s, "px", 3);
 	obs_data_set_default_bool(s, "peaks", true);
+	obs_data_set_default_bool(s, "baseline", false);
 	obs_data_set_default_int(s, "layers", 1);
 	obs_data_set_default_int(s, "font", 16);
 	obs_data_set_default_int(s, "sine_count", 5);
@@ -1168,6 +1172,7 @@ static void ew_update(void *data, obs_data_t *s)
 	e->gap = ew_clampi(obs_data_get_int(s, "gap"), 0, 64);
 	e->px = ew_clampi(obs_data_get_int(s, "px"), 1, 32);
 	e->peaks = obs_data_get_bool(s, "peaks");
+	e->baseline = obs_data_get_bool(s, "baseline");
 	e->layers = ew_clampi(obs_data_get_int(s, "layers"), 1, 12);
 	e->font = ew_clampi(obs_data_get_int(s, "font"), 8, 96);
 	e->sine_count = ew_clampi(obs_data_get_int(s, "sine_count"), 1, 12);
