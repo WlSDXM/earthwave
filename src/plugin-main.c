@@ -1,6 +1,6 @@
 /*
-Plugin Name
-Copyright (C) <Year> <Developer> <Email Address>
+EARTH//WAVE - audio reactive visual source for OBS
+Copyright (C) 2026 Theo Kano
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -22,8 +22,11 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
+extern struct obs_source_info earthwave_source_info;
+
 bool obs_module_load(void)
 {
+	obs_register_source(&earthwave_source_info);
 	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
 	return true;
 }

@@ -33,13 +33,13 @@
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.example.plugintemplate-for-obs"
+            "bundleId": "org.neocities.theokano.earthwave"
         }
     },
-    "name": "plugintemplate-for-obs",
-    "displayName": "Plugin Template for OBS",
+    "name": "earthwave",
+    "displayName": "EARTH//WAVE",
     "version": "1.0.0",
-    "author": "Your Name Here",
-    "website": "https://example.com",
-    "email": "me@example.com"
+    "author": "Theo Kano",
+    "website": "https://theokano.neocities.org",
+    "email": "noreply@example.com"
 }
