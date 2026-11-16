@@ -31,9 +31,31 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define SPAN 1024
 #define WBUF 2048
 #define HIST 16
+#define RIDGE 16
 #define MIX_NAME "__earthwave_output_mix__"
 
-enum ew_style { STYLE_BARS, STYLE_SOLID, STYLE_CENTER, STYLE_SINES, STYLE_SCOPE, STYLE_ASCII };
+enum ew_style {
+	STYLE_BARS,
+	STYLE_SOLID,
+	STYLE_CENTER,
+	STYLE_SINES,
+	STYLE_SCOPE,
+	STYLE_ASCII,
+	STYLE_LED,
+	STYLE_RIDGE,
+	STYLE_PIXWAVE,
+	STYLE_CURVE,
+	STYLE_WATER, /* retired */
+	STYLE_DITHER,
+	STYLE_SEA, /* retired: kept so saved style numbers still match */
+	STYLE_OCEAN,
+	STYLE_GLOW, /* retired */
+	STYLE_REFLECT,
+	STYLE_SKYLINE,
+	STYLE_KANA,
+	STYLE_RAIN,
+	STYLE_LAST = STYLE_RAIN
+};
 
 struct ew_vert {
 	float x, y;
@@ -49,7 +71,7 @@ struct ew {
 	bool mirror, gradient, gradient3, bg_on, peaks, baseline;
 	uint32_t color, color2, color3, bg;
 	int width, height, bars, gap, px, layers, font, sine_count, sine_thick;
-	float scale, sens, smooth, decay, sine_speed, sine_size;
+	float scale, sens, smooth, decay, sine_speed, sine_size, sine_react, length;
 
 	/* audio in */
 	obs_weak_source_t *audio_weak;
@@ -83,7 +105,15 @@ struct ew {
 	float hist_pk[HIST], hist_phase[HIST], hist_amp[HIST];
 	int hist_pos, hist_count;
 	float hist_acc;
-	const float *cw_buf; /* the waveform ew_wave_at reads from (current frame or a past one) */
+	float ridge[RIDGE][MAXB]; /* past spectra for the ridgeline style, newest at ridge_pos */
+	int ridge_pos;
+	float ridge_acc;
+	float energy, water_t;           /* slow overall loudness, and the sea's own clock */
+	float rain_t;                    /* the rain's own clock: runs faster when the music is louder */
+	double clock;                    /* seconds since the source started, for the sea styles */
+	float beat, avg_bass, prev_bass; /* kick detector: beat jumps to 1 on a kick and decays */
+	float ox;                        /* x offset applied to everything drawn (for the Length slider) */
+	const float *cw_buf;             /* the waveform ew_wave_at reads from (current frame or a past one) */
 	int cw_st;
 	float cw_pk;
 	float cycle_t;
@@ -360,6 +390,33 @@ static void ew_analyse(struct ew *e, float dt)
 	}
 }
 
+/* slow overall loudness, used by the water style for the sea level */
+static void ew_energy(struct ew *e, float dt)
+{
+	float avg = 0.0f;
+	for (int i = 0; i < e->band_n; i++)
+		avg += e->val[i];
+	avg /= (float)(e->band_n > 0 ? e->band_n : 1);
+	const float k = 1.0f - expf(-dt / (avg > e->energy ? 0.15f : 0.7f));
+	e->energy += (avg - e->energy) * k;
+	e->water_t += dt * (0.6f + e->energy * 2.2f);
+	if (e->water_t > 4000.0f * EW_PI)
+		e->water_t -= 4000.0f * EW_PI;
+	e->clock += (double)dt;
+	e->rain_t += dt * (0.6f + e->energy * 2.5f);
+	if (e->rain_t > 100000.0f)
+		e->rain_t -= 100000.0f;
+
+	/* kick = bass well above its recent average, or a sudden jump in bass */
+	const float bass = ew_band_avg(e, 0.0f, 0.2f);
+	e->avg_bass += (bass - e->avg_bass) * (1.0f - expf(-dt / 0.33f));
+	const float rise = bass - e->prev_bass;
+	e->prev_bass = bass;
+	const bool hit = (bass > e->avg_bass * 1.25f && bass > 0.25f) ||
+			 (rise > 0.045f && bass > 0.3f && e->beat < 0.5f);
+	e->beat = hit ? 1.0f : e->beat * powf(0.88f, dt * 60.0f);
+}
+
 static void ew_grab_wave(struct ew *e, float dt)
 {
 	ew_latest(e, e->wbuf, WBUF);
@@ -413,7 +470,7 @@ static void ew_history(struct ew *e, float dt)
 		return;
 	e->hist_acc = 0.0f;
 	e->hist_pos = (e->hist_pos + 1) % HIST;
-	if (e->style == STYLE_SCOPE || e->style == STYLE_ASCII)
+	if (e->style == STYLE_SCOPE || e->style == STYLE_ASCII || e->style == STYLE_PIXWAVE)
 		memcpy(e->hist_wave[e->hist_pos], e->wbuf, sizeof(e->wbuf));
 	e->hist_st[e->hist_pos] = e->wave_st;
 	e->hist_pk[e->hist_pos] = e->wave_pk;
@@ -488,17 +545,28 @@ static void ew_tick(void *data, float seconds)
 		ew_build_bands(e, rate);
 
 	ew_analyse(e, dt);
+	ew_energy(e, dt);
 
-	if (e->style == STYLE_SCOPE || e->style == STYLE_ASCII)
+	if (e->style == STYLE_SCOPE || e->style == STYLE_ASCII || e->style == STYLE_PIXWAVE)
 		ew_grab_wave(e, dt);
 
+	if (e->style == STYLE_RIDGE) {
+		e->ridge_acc += dt;
+		if (e->ridge_acc >= 1.0f / 24.0f) {
+			e->ridge_acc = 0.0f;
+			e->ridge_pos = (e->ridge_pos + 1) % RIDGE;
+			memcpy(e->ridge[e->ridge_pos], e->val, sizeof(e->val));
+		}
+	}
+
 	if (e->style == STYLE_SINES) {
-		e->wave_phase += 0.9f * e->sine_speed * dt;
-		if (e->wave_phase > 2000.0f * EW_PI)
-			e->wave_phase -= 2000.0f * EW_PI;
 		float bass = ew_band_avg(e, 0.0f, 0.2f) * 1.4f;
 		if (bass > 1.0f)
 			bass = 1.0f;
+		/* the drift surges forward on the bass, so the lines visibly push with the beat */
+		e->wave_phase += 0.9f * e->sine_speed * dt * (1.0f + bass * 2.5f * e->sine_react);
+		if (e->wave_phase > 2000.0f * EW_PI)
+			e->wave_phase -= 2000.0f * EW_PI;
 		e->sine_amp = 1.0f + bass * 0.9f;
 	}
 
@@ -526,9 +594,26 @@ static void ew_quad(struct ew *e, float x0, float y0, float x1, float y1, float 
 	const float xs[6] = {x0, x1, x2, x2, x1, x3};
 	const float ys[6] = {y0, y1, y2, y2, y1, y3};
 	for (int i = 0; i < 6; i++) {
-		v[i].x = xs[i];
+		v[i].x = xs[i] + e->ox;
 		v[i].y = ys[i];
 		v[i].c = c;
+	}
+	e->vn += 6;
+}
+
+/* quad with a colour per corner (top-left, top-right, bottom-left, bottom-right) */
+static void ew_quad_grad(struct ew *e, float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3,
+			 uint32_t c_top, uint32_t c_bottom)
+{
+	ew_reserve(e, 6);
+	struct ew_vert *v = e->v + e->vn;
+	const float xs[6] = {x0, x1, x2, x2, x1, x3};
+	const float ys[6] = {y0, y1, y2, y2, y1, y3};
+	const uint32_t cs[6] = {c_top, c_top, c_bottom, c_bottom, c_top, c_bottom};
+	for (int i = 0; i < 6; i++) {
+		v[i].x = xs[i] + e->ox;
+		v[i].y = ys[i];
+		v[i].c = cs[i];
 	}
 	e->vn += 6;
 }
@@ -736,27 +821,50 @@ static void ew_draw_center(struct ew *e, float W, float H, bool linear)
 }
 
 /* drifting water lines; they swell on the bass */
-static void ew_sines_pass(struct ew *e, float W, float H, bool linear, float wave_phase, float sine_amp, float am)
+static void ew_sines_pass(struct ew *e, float W, float H, bool linear, float wave_phase, float am)
 {
 	const int count = e->sine_count < 1 ? 1 : e->sine_count;
 	const float k = H / 150.0f * e->sine_size;
-	int steps = (int)floorf(W / 8.0f);
+	int steps = (int)floorf(W / 6.0f);
 	if (steps < 40)
 		steps = 40;
 
 	for (int wi = 0; wi < count; wi++) {
 		const float f = count > 1 ? (float)wi / (float)(count - 1) : 1.0f;
 		const float y_t = 0.18f + f * 0.74f;
-		const float base_y = H * (count > 1 ? 0.14f + f * 0.72f : 0.5f);
+		const float base_y = H * (count > 1 ? 0.2f + f * 0.6f : 0.5f);
 		const float depth_amp = (2.0f + y_t * 6.0f) * k;
 		const float phase = wave_phase + (float)wi * 0.7f;
 		const uint32_t c = ew_color(e, 1.0f - f, (0.6f + y_t * 0.7f) * 0.8f * am, linear);
+
+		/* each line listens to its own slice of the spectrum: front line = bass, back line = highs */
+		const float slice = 1.0f / (float)count;
+		const float lo = (1.0f - f) * (1.0f - slice);
+		float energy = ew_band_avg(e, lo, lo + slice);
+		if (energy > 1.0f)
+			energy = 1.0f;
+		float amp = depth_amp * (0.35f + energy * 3.0f * e->sine_react) * e->sine_amp;
+		float ripple = depth_amp * 0.9f * energy * e->sine_react;
+		/* keep the whole swing inside the source so peaks are never cut flat */
+		float room = (base_y < H - base_y ? base_y : H - base_y) - 2.0f;
+		if (room < 1.0f)
+			room = 1.0f;
+		const float swing = amp * 1.3f + ripple;
+		if (swing > room) {
+			amp *= room / swing;
+			ripple *= room / swing;
+		}
 		float px = 0.0f, py = 0.0f;
 
 		for (int s = 0; s <= steps; s++) {
 			const float x_t = (float)s / (float)steps;
-			const float y = base_y + sinf(x_t * EW_PI * 3.0f + phase) * depth_amp * sine_amp +
-					sinf(x_t * EW_PI * 7.0f + phase * 1.3f) * depth_amp * 0.3f;
+			float y = base_y + sinf(x_t * EW_PI * 3.0f + phase) * amp +
+				  sinf(x_t * EW_PI * 7.0f + phase * 1.3f) * amp * 0.3f +
+				  sinf(x_t * EW_PI * 23.0f - phase * 3.1f) * ripple;
+			if (y < 1.0f)
+				y = 1.0f;
+			if (y > H - 1.0f)
+				y = H - 1.0f;
 			const float x = x_t * W;
 			if (s > 0)
 				ew_line(e, px, py, x, y, (float)e->sine_thick, c);
@@ -771,9 +879,9 @@ static void ew_draw_sines(struct ew *e, float W, float H, bool linear)
 	const int n = ew_ghosts(e, e->sine_count > 4 ? 2 : 1);
 	for (int age = n; age >= 1; age--) {
 		const int h = ew_hist_index(e, age);
-		ew_sines_pass(e, W, H, linear, e->hist_phase[h], e->hist_amp[h], ew_ghost_alpha(age, n));
+		ew_sines_pass(e, W, H, linear, e->hist_phase[h], ew_ghost_alpha(age, n));
 	}
-	ew_sines_pass(e, W, H, linear, e->wave_phase, e->sine_amp, 1.0f);
+	ew_sines_pass(e, W, H, linear, e->wave_phase, 1.0f);
 }
 
 static void ew_scope_pass(struct ew *e, float W, float H, bool linear, float am)
@@ -825,14 +933,49 @@ static void ew_draw_scope(struct ew *e, float W, float H, bool linear)
 }
 
 /* 5x7 glyphs for - _ / \ | (one byte per row, bit 4 = left column) */
-static const uint8_t ew_glyphs[5][7] = {
+enum ew_glyph_id {
+	G_DASH,
+	G_UNDER,
+	G_SLASH,
+	G_BSLASH,
+	G_PIPE,
+	G_TILDE,
+	G_APPROX,
+	G_DOT,
+	G_EQUAL,
+	G_PLUS,
+	G_STAR,
+	G_O,
+	G_SHADE1,
+	G_SHADE2,
+	G_COUNT
+};
+
+/* 5x7 glyphs (one byte per row, bit 4 = left column); the two shade glyphs are drawn as patterns instead */
+static const uint8_t ew_glyphs[G_COUNT][7] = {
 	{0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00}, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F},
 	{0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10}, {0x10, 0x08, 0x08, 0x04, 0x02, 0x02, 0x01},
-	{0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
+	{0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}, {0x00, 0x00, 0x08, 0x15, 0x02, 0x00, 0x00},
+	{0x00, 0x08, 0x15, 0x02, 0x08, 0x15, 0x02}, {0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00},
+	{0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00}, {0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00},
+	{0x00, 0x15, 0x0E, 0x1F, 0x0E, 0x15, 0x00}, {0x00, 0x00, 0x0E, 0x11, 0x11, 0x0E, 0x00},
+	{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 };
 
 static void ew_glyph(struct ew *e, int g, float x, float y, float u, uint32_t c)
 {
+	if (g == G_SHADE1 || g == G_SHADE2) {
+		/* light and medium shade blocks: a dot pattern over the whole 6x8 cell */
+		for (int r = 0; r < 8; r++) {
+			for (int col = 0; col < 6; col++) {
+				const bool on = g == G_SHADE1 ? (r % 2 == 0 && (col + r) % 4 == 0)
+							      : ((col + r) % 2 == 0);
+				if (on)
+					ew_rect(e, x + (float)col * u, y + (float)r * u, u, u, c);
+			}
+		}
+		return;
+	}
 	for (int r = 0; r < 7; r++) {
 		const uint8_t bits = ew_glyphs[g][r];
 		for (int col = 0; col < 5; col++)
@@ -872,12 +1015,12 @@ static void ew_ascii_pass(struct ew *e, float W, float H, bool linear, float am)
 		const int r0 = (int)floorf(y0), r1 = (int)floorf(y1);
 		const float x = (float)col * cw;
 		if (r1 == r0) {
-			ew_glyph(e, (y0 - (float)r0) < 0.6f ? 0 : 1, x, top + (float)r0 * lh, u, c);
+			ew_glyph(e, (y0 - (float)r0) < 0.6f ? G_DASH : G_UNDER, x, top + (float)r0 * lh, u, c);
 		} else {
 			const int step = r1 < r0 ? -1 : 1;
-			ew_glyph(e, r1 < r0 ? 2 : 3, x, top + (float)r0 * lh, u, c);
+			ew_glyph(e, r1 < r0 ? G_SLASH : G_BSLASH, x, top + (float)r0 * lh, u, c);
 			for (int r = r0 + step; r != r1; r += step)
-				ew_glyph(e, 4, x, top + (float)r * lh, u, c);
+				ew_glyph(e, G_PIPE, x, top + (float)r * lh, u, c);
 		}
 		y0 = y1;
 	}
@@ -894,19 +1037,640 @@ static void ew_draw_ascii(struct ew *e, float W, float H, bool linear)
 	ew_ascii_pass(e, W, H, linear, 1.0f);
 }
 
+/* LED meter: stacked segments, coloured by how high they sit (base colour at the bottom, last colour at the top) */
+static void ew_draw_led(struct ew *e, float W, float H, bool linear)
+{
+	const int nb = e->band_n;
+	const int n2 = e->mirror ? nb * 2 : nb;
+	const float seg = (float)e->px * 2.0f;
+	const float pitch = seg + (float)(e->px > 2 ? e->px : 2);
+	int rows = (int)floorf(H / pitch);
+	if (rows < 3)
+		rows = 3;
+
+	for (int j = 0; j < n2; j++) {
+		const int i = !e->mirror ? j : (j < nb ? nb - 1 - j : j - nb);
+		const float x = roundf((float)j * W / (float)n2);
+		float w = roundf((float)(j + 1) * W / (float)n2) - x - (float)(e->gap > 1 ? e->gap : 1);
+		if (w < 1.0f)
+			w = 1.0f;
+		int n = (int)roundf(e->val[i] * (float)rows);
+		if (n < 1)
+			n = e->baseline ? 1 : 0;
+
+		for (int r = 0; r < n; r++)
+			ew_rect(e, x, H - (float)(r + 1) * pitch + (pitch - seg), w, seg,
+				ew_color(e, (float)r / (float)(rows - 1), 1.0f, linear));
+
+		if (e->trails > 0.0f) {
+			const int tr = (int)roundf(e->trail[i] * (float)rows);
+			for (int r = n; r < tr; r++)
+				ew_rect(e, x, H - (float)(r + 1) * pitch + (pitch - seg), w, seg,
+					ew_color(e, (float)r / (float)(rows - 1), 0.28f, linear));
+		}
+
+		if (e->peaks) {
+			const int hr = (int)roundf(e->hold[i] * (float)rows);
+			if (hr > n && hr < rows + 1)
+				ew_rect(e, x, H - (float)(hr + 1) * pitch + (pitch - seg), w, seg,
+					ew_color(e, (float)hr / (float)(rows - 1), 1.0f, linear));
+		}
+	}
+}
+
+/* value of the (optionally mirrored) spectrum at point j of n2, from a given set of bands */
+static float ew_spec(const struct ew *e, const float *vals, int j, int n2)
+{
+	const int nb = e->band_n;
+	if (j < 0)
+		j = 0;
+	if (j > n2 - 1)
+		j = n2 - 1;
+	const int i = !e->mirror ? j : (j < nb ? nb - 1 - j : j - nb);
+	return vals[i];
+}
+
+/* smooth (Catmull-Rom) reading of the spectrum at fractional point p */
+static float ew_spec_smooth(const struct ew *e, const float *vals, float p, int n2)
+{
+	const int j = (int)floorf(p);
+	const float t = p - (float)j;
+	const float a = ew_spec(e, vals, j - 1, n2), b = ew_spec(e, vals, j, n2);
+	const float c = ew_spec(e, vals, j + 1, n2), d = ew_spec(e, vals, j + 2, n2);
+	float v = 0.5f * ((2.0f * b) + (-a + c) * t + (2.0f * a - 5.0f * b + 4.0f * c - d) * t * t +
+			  (-a + 3.0f * b - 3.0f * c + d) * t * t * t);
+	if (v < 0.0f)
+		v = 0.0f;
+	if (v > 1.0f)
+		v = 1.0f;
+	return v;
+}
+
+/* ridgeline: the spectrum as a line, with older moments stacked up behind it and fading away */
+static void ew_draw_ridge(struct ew *e, float W, float H, bool linear)
+{
+	const int nb = e->band_n;
+	const int n2 = e->mirror ? nb * 2 : nb;
+	int lines = 4 + e->layers;
+	if (lines > RIDGE)
+		lines = RIDGE;
+	const int sub = 4;
+	const int pts = (n2 - 1) * sub;
+
+	for (int k = lines - 1; k >= 0; k--) {
+		const float *vals = e->ridge[((e->ridge_pos - k) % RIDGE + RIDGE) % RIDGE];
+		const float depth = (float)k / (float)(lines - 1);
+		const float base = H - 2.0f - depth * H * 0.55f;
+		const float amp = H * 0.42f * (1.0f - depth * 0.45f);
+		const float span = W * (1.0f - depth * 0.3f);
+		const float x0 = (W - span) * 0.5f;
+		const uint32_t c = ew_color(e, depth, 1.0f - depth * 0.8f, linear);
+		float px = 0.0f, py = 0.0f;
+		bool pen = false;
+
+		for (int s = 0; s <= pts; s++) {
+			const float v = ew_spec_smooth(e, vals, (float)s / (float)sub, n2);
+			const float x = x0 + span * (float)s / (float)pts;
+			const float y = base - v * amp;
+			/* nothing is drawn where the spectrum is silent, so there is no resting line */
+			const bool on = v > 0.012f;
+			if (pen && on)
+				ew_line(e, px, py, x, y, k == 0 ? 2.0f : 1.5f, c);
+			px = x;
+			py = y;
+			pen = on;
+		}
+	}
+}
+
+/* spectrum as a smooth glowing outline with a soft fill underneath */
+static void ew_curve_pass(struct ew *e, const float *vals, float W, float H, bool linear, float am, bool fill)
+{
+	const int nb = e->band_n;
+	const int n2 = e->mirror ? nb * 2 : nb;
+	const int sub = 4;
+	const int pts = (n2 - 1) * sub;
+	const float amp = H - 4.0f;
+	const uint32_t line = ew_color(e, 0.0f, am, linear);
+	const uint32_t clear = ew_color(e, 0.0f, 0.0f, linear);
+	float px = 0.0f, pv = 0.0f;
+
+	for (int s = 0; s <= pts; s++) {
+		const float v = ew_spec_smooth(e, vals, (float)s / (float)sub, n2);
+		const float x = W * (float)s / (float)pts;
+		if (s > 0 && (v > 0.012f || pv > 0.012f)) {
+			const float y0 = H - pv * amp, y1 = H - v * amp;
+			if (fill) {
+				const float mid = (pv + v) * 0.5f;
+				ew_quad_grad(e, px, y0, x, y1, px, H, x, H,
+					     ew_color(e, 0.4f + mid * 0.6f, 0.55f * am, linear), clear);
+			}
+			ew_line(e, px, y0, x, y1, 2.0f, line);
+		}
+		px = x;
+		pv = v;
+	}
+}
+
+static void ew_draw_curve(struct ew *e, float W, float H, bool linear)
+{
+	if (e->trails > 0.0f)
+		ew_curve_pass(e, e->trail, W, H, linear, 0.35f, false);
+	ew_curve_pass(e, e->val, W, H, linear, 1.0f, true);
+}
+
+/* the waveform as chunky pixel columns mirrored around the middle, tips broken into layers */
+static void ew_pixwave_pass(struct ew *e, float W, float H, bool linear, float am)
+{
+	const float px = (float)e->px;
+	const float colw = px * 2.0f;
+	const float gp = px;
+	const int cols = (int)floorf(W / (colw + gp));
+	const float mid = ew_snap(H * 0.5f, px);
+	int rows = (int)floorf(H * 0.5f / px) - 1;
+	if (rows < 2)
+		rows = 2;
+	if (cols < 2)
+		return;
+	const float x0 = floorf((W - (float)cols * (colw + gp) + gp) * 0.5f);
+
+	for (int c = 0; c < cols; c++) {
+		float pk = 0.0f;
+		for (int k = 0; k < 4; k++) {
+			const float a = fabsf(ew_wave_at(e, ((float)c + (float)k * 0.25f) / (float)cols, 0));
+			if (a > pk)
+				pk = a;
+		}
+		const int n = (int)roundf(pk * (float)rows);
+		const float x = x0 + (float)c * (colw + gp);
+		for (int r = 0; r < n; r++) {
+			const float t = (float)r / (float)n;
+			if (t > 0.5f && (n - 1 - r) % 2 == 1)
+				continue;
+			const uint32_t col = ew_color(e, (t - 0.3f) / 0.7f, am, linear);
+			ew_rect(e, x, mid - (float)(r + 1) * px, colw, px, col);
+			ew_rect(e, x, mid + (float)r * px, colw, px, col);
+		}
+	}
+}
+
+static void ew_draw_pixwave(struct ew *e, float W, float H, bool linear)
+{
+	const int n = ew_ghosts(e, 4);
+	for (int age = n; age >= 1; age--) {
+		ew_use_wave(e, age);
+		ew_pixwave_pass(e, W, H, linear, ew_ghost_alpha(age, n) * 0.7f);
+	}
+	ew_use_wave(e, 0);
+	ew_pixwave_pass(e, W, H, linear, 1.0f);
+}
+
+static const uint8_t ew_bayer[4][4] = {{0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5}};
+
+/* ordered dither: is the pixel at (cx, cy) lit for a density of d (0..1)? */
+static bool ew_dither(int cx, int cy, float d)
+{
+	return d > ((float)ew_bayer[cy & 3][cx & 3] + 0.5f) / 16.0f;
+}
+
+/* bars filled with a dither pattern: dense at the base, breaking up into scattered pixels toward the top */
+static void ew_draw_dither(struct ew *e, float W, float H, bool linear)
+{
+	const float px = (float)e->px;
+	const int nb = e->band_n;
+	const int n2 = e->mirror ? nb * 2 : nb;
+	int rows = (int)floorf(H / px);
+	if (rows < 4)
+		rows = 4;
+	const float gp = floorf((float)e->gap / px) * px;
+	const uint32_t dash = ew_color(e, 1.0f, 1.0f, linear);
+	const uint32_t ghost = ew_color(e, 1.0f, 0.6f, linear);
+
+	for (int j = 0; j < n2; j++) {
+		const int i = !e->mirror ? j : (j < nb ? nb - 1 - j : j - nb);
+		const float x = ew_snap((float)j * W / (float)n2, px);
+		const float w = ew_snap((float)(j + 1) * W / (float)n2, px) - x - gp;
+		if (w <= 0.0f)
+			continue;
+		const int cols = (int)roundf(w / px);
+		const int cx0 = (int)roundf(x / px);
+
+		int n = (int)roundf(e->val[i] * (float)(rows - 2));
+		if (n < 1)
+			n = e->baseline ? 1 : 0;
+		int top = n;
+		if (e->trails > 0.0f) {
+			const int tr = (int)roundf(e->trail[i] * (float)(rows - 2));
+			if (tr > top)
+				top = tr;
+		}
+
+		for (int r = 0; r < top; r++) {
+			const float t = n > 0 ? (float)r / (float)n : 1.0f;
+			const float dens = r < n ? 1.0f - powf(t, 1.4f) * 0.92f : 0.2f;
+			const uint32_t c = r < n ? ew_color(e, t, 1.0f, linear) : ghost;
+			const float y = H - (float)(r + 1) * px;
+			int run = -1;
+			for (int k = 0; k <= cols; k++) {
+				const bool lit = k < cols && ew_dither(cx0 + k, rows - 1 - r, dens);
+				if (lit && run < 0)
+					run = k;
+				if (!lit && run >= 0) {
+					ew_rect(e, x + (float)run * px, y, (float)(k - run) * px, px, c);
+					run = -1;
+				}
+			}
+		}
+
+		if (e->peaks) {
+			const int hr = (int)roundf(e->hold[i] * (float)(rows - 2));
+			if (hr > n + 1) {
+				const float y = H - (float)(hr + 1) * px;
+				if (w < px * 3.0f) {
+					ew_rect(e, x, y, w, px, dash);
+				} else {
+					for (float dx = px; dx + px <= w - px; dx += px * 2.0f)
+						ew_rect(e, x + dx, y, px, px, dash);
+				}
+			}
+		}
+	}
+}
+
+/* ---- sea styles, ported from the zig~zag "earth" map skin ---- */
+
+static float ew_clamp01(float x)
+{
+	return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
+}
+
+/* how visible the always-moving styles are: they fade out at silence unless "Show Baseline When Silent" is on */
+static float ew_presence(const struct ew *e)
+{
+	return e->baseline ? 1.0f : ew_clamp01(e->energy * 6.0f);
+}
+
+/* the ocean: a sea surface that rises with the spectrum, made of ~, the double wave and shade blocks */
+static void ew_draw_ocean(struct ew *e, float W, float H, bool linear)
+{
+	float u = roundf((float)e->font / 8.0f);
+	if (u < 1.0f)
+		u = 1.0f;
+	const float cw = u * 6.0f, lh = u * 8.0f;
+	const int cols = (int)floorf(W / cw);
+	const int rows = (int)floorf(H / lh);
+	const float vis = ew_presence(e);
+	if (cols < 2 || rows < 2 || vis < 0.01f)
+		return;
+	const int n2 = e->mirror ? e->band_n * 2 : e->band_n;
+	const float tt = (float)e->clock;
+	const float hb = (float)rows * lh;
+	float bass = ew_band_avg(e, 0.0f, 0.2f);
+	if (bass > 1.0f)
+		bass = 1.0f;
+	const float pump = ew_clamp01(0.8f + e->beat * 0.35f);
+	const uint32_t under = ew_color(e, 1.0f, 0.3f * vis, linear);
+
+	for (int c = 0; c < cols; c++) {
+		const float xs = ((float)c + 0.5f) / (float)cols;
+		const float v = ew_spec_smooth(e, e->val, xs * (float)(n2 - 1), n2);
+		const float surf = (hb * (0.22f + 0.65f * powf(v, 0.8f)) +
+				    lh * 3.5f * sinf(xs * 9.0f + tt * 1.4f) * (0.4f + bass * 1.4f) * 0.35f +
+				    lh * 1.4f * sinf(xs * 27.0f - tt * 2.6f) * 0.35f + e->beat * lh * 0.7f) *
+				   vis;
+		for (int rb = 0; rb < rows; rb++) {
+			const float depth = surf / lh - (float)rb;
+			if (depth < 0.0f)
+				break;
+			const int g = depth < 1.0f   ? G_TILDE
+				      : depth < 2.0f ? G_APPROX
+				      : depth < 4.0f ? G_SHADE1
+						     : G_SHADE2;
+			const float x = (float)c * cw, y = H - (float)(rb + 1) * lh;
+			if (depth >= 1.0f)
+				ew_rect(e, x, y, cw, lh, under);
+			ew_glyph(e, g, x, y, u, ew_color(e, depth / 7.0f, pump * vis, linear));
+		}
+	}
+}
+
+/* 32 glyphs, 16x16, rows top to bottom, bit 15 = left column:
+   "・ーノくしつのミラネ木水音波夢響0123456789:<>=+*"
+   rasterised from Noto Sans CJK JP Bold (SIL Open Font License 1.1) */
+#define KG_COUNT 32
+#define KG_KANA 16 /* the first 16 run light -> dense */
+#define KG_DIGITS 16
+static const uint16_t ew_kana_glyphs[KG_COUNT][16] = {
+	{0x0000, 0x0000, 0x0000, 0x0000, 0x01C0, 0x01C0, 0x01C0, 0x01C0, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x3FFE, 0x3FFE, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0018, 0x0018, 0x0038, 0x0030, 0x0070, 0x0060, 0x00E0, 0x01C0, 0x0380, 0x0F00, 0x1E00, 0x0800,
+	 0x0000, 0x0000},
+	{0x0000, 0x0020, 0x0070, 0x00E0, 0x03C0, 0x0700, 0x0E00, 0x0C00, 0x0E00, 0x0700, 0x03C0, 0x01E0, 0x00F0, 0x0070,
+	 0x0000, 0x0000},
+	{0x0000, 0x0E00, 0x0C00, 0x0C00, 0x0C00, 0x0C00, 0x0C00, 0x0C00, 0x0C00, 0x0C00, 0x0C04, 0x0C0E, 0x0E3C, 0x07F8,
+	 0x03E0, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x1FFC, 0x3E0C, 0x300E, 0x0006, 0x0006, 0x000E, 0x001C, 0x0078, 0x03F0, 0x03C0, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x03F0, 0x0FF8, 0x1DDC, 0x198C, 0x3186, 0x3186, 0x3186, 0x330E, 0x3F0C, 0x1E1C, 0x0CF8, 0x0070,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x07E0, 0x07F8, 0x0038, 0x0000, 0x0F80, 0x0FF0, 0x0070, 0x0000, 0x0E00, 0x1FE0, 0x03F8, 0x0018,
+	 0x0000, 0x0000},
+	{0x0000, 0x0FF8, 0x0FF8, 0x0000, 0x0000, 0x1FFC, 0x1FFC, 0x000C, 0x001C, 0x0018, 0x0070, 0x00F0, 0x03E0, 0x0380,
+	 0x0000, 0x0000},
+	{0x0000, 0x01C0, 0x00C0, 0x1FF8, 0x1FFC, 0x0038, 0x0070, 0x01E0, 0x07D8, 0x1FDC, 0x3CCE, 0x10C0, 0x00C0, 0x01C0,
+	 0x0080, 0x0000},
+	{0x01C0, 0x01C0, 0x01C0, 0x01C0, 0x3FFE, 0x3FFE, 0x03E0, 0x03E0, 0x07F0, 0x0FD8, 0x1DDC, 0x39CE, 0x31C6, 0x01C0,
+	 0x01C0, 0x0000},
+	{0x0000, 0x00C0, 0x00C0, 0x00C6, 0x3FCE, 0x3FFC, 0x06F8, 0x0EF0, 0x0CF0, 0x0CF8, 0x18DC, 0x38CE, 0x31CE, 0x0782,
+	 0x0780, 0x0000},
+	{0x0180, 0x1FFC, 0x1FFE, 0x0638, 0x0630, 0x3FFE, 0x3FFE, 0x0FF8, 0x0FF8, 0x0C18, 0x0C18, 0x0FF8, 0x0C18, 0x0FF8,
+	 0x0FF8, 0x0000},
+	{0x1030, 0x1C30, 0x0BFE, 0x03FE, 0x2336, 0x3B34, 0x1BFC, 0x03FC, 0x03CC, 0x0B7C, 0x1B78, 0x1A38, 0x367C, 0x37EE,
+	 0x0486, 0x0000},
+	{0x3FFE, 0x3FFE, 0x0630, 0x1FFC, 0x1B6C, 0x1B6C, 0x1FFC, 0x0000, 0x3FFE, 0x3306, 0x3FF6, 0x1E70, 0x03E0, 0x1F80,
+	 0x1E00, 0x0000},
+	{0x1BE0, 0x3F7E, 0x3BFE, 0x1F7E, 0x3FFA, 0x3F5A, 0x1BFE, 0x3FFC, 0x0630, 0x0630, 0x3FFE, 0x0FF8, 0x0FFC, 0x0C0C,
+	 0x0FFC, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x03E0, 0x0670, 0x0630, 0x0630, 0x0630, 0x0630, 0x0630, 0x0670, 0x03E0, 0x01C0, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x03C0, 0x01C0, 0x00C0, 0x00C0, 0x00C0, 0x00C0, 0x00C0, 0x00C0, 0x07F0, 0x07F0, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x07E0, 0x0460, 0x0070, 0x0060, 0x0060, 0x00C0, 0x01C0, 0x0380, 0x07F0, 0x07F0, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x07E0, 0x0070, 0x0060, 0x01E0, 0x01C0, 0x0070, 0x0030, 0x0470, 0x07E0, 0x03C0, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x01E0, 0x01E0, 0x0360, 0x0360, 0x0660, 0x0FF0, 0x0FF0, 0x0060, 0x0060, 0x0060, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x07F0, 0x0600, 0x0600, 0x07E0, 0x07F0, 0x0070, 0x0030, 0x0470, 0x07E0, 0x03C0, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x03F0, 0x0700, 0x0600, 0x06E0, 0x07F0, 0x0630, 0x0630, 0x0630, 0x03F0, 0x01E0, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x07F0, 0x0060, 0x0060, 0x00C0, 0x00C0, 0x01C0, 0x0180, 0x0180, 0x0180, 0x0180, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x07E0, 0x0630, 0x0630, 0x03E0, 0x03E0, 0x0670, 0x0630, 0x0630, 0x07F0, 0x03E0, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x07E0, 0x0670, 0x0630, 0x0630, 0x07F0, 0x03B0, 0x0030, 0x0060, 0x07E0, 0x03C0, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x0000, 0x01C0, 0x0180, 0x0000, 0x0000, 0x0000, 0x0080, 0x01C0, 0x0180, 0x0000, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x0000, 0x0070, 0x01F0, 0x0780, 0x0700, 0x03C0, 0x00F0, 0x0010, 0x0000, 0x0000, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x0000, 0x0600, 0x07C0, 0x00F0, 0x0070, 0x03E0, 0x0780, 0x0400, 0x0000, 0x0000, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x0000, 0x07F0, 0x0000, 0x0000, 0x07F0, 0x07F0, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0000, 0x0080, 0x0080, 0x0080, 0x07F0, 0x07F0, 0x0080, 0x0080, 0x0080, 0x0000, 0x0000, 0x0000,
+	 0x0000, 0x0000},
+	{0x0000, 0x0000, 0x0100, 0x0180, 0x07E0, 0x0380, 0x03C0, 0x0240, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+	 0x0000, 0x0000},
+};
+
+/* stable pseudo-random number 0..1 from three integers */
+static float ew_rand3(int a, int b, int c)
+{
+	uint32_t h = (uint32_t)a * 0x8DA6B343u ^ (uint32_t)b * 0xD8163841u ^ (uint32_t)c * 0xCB1AB31Fu;
+	h ^= h >> 15;
+	h *= 0x2C1B3C6Du;
+	h ^= h >> 12;
+	h *= 0x297A2D39u;
+	h ^= h >> 15;
+	return (float)(h >> 8) / 16777216.0f;
+}
+
+/* one 16x16 glyph from the atlas, drawn as runs of pixels so each row is only a few rectangles */
+static void ew_kglyph(struct ew *e, int g, float x, float y, float u, uint32_t c)
+{
+	for (int r = 0; r < 16; r++) {
+		const uint16_t bits = ew_kana_glyphs[g][r];
+		int run = -1;
+		for (int col = 0; col <= 16; col++) {
+			const bool on = col < 16 && (bits & (0x8000 >> col));
+			if (on && run < 0)
+				run = col;
+			if (!on && run >= 0) {
+				ew_rect(e, x + (float)run * u, y + (float)r * u, (float)(col - run) * u, u, c);
+				run = -1;
+			}
+		}
+	}
+}
+
+/* spectrum level for column c of cols (follows Mirror and the band count) */
+static float ew_col_level(const struct ew *e, int c, int cols)
+{
+	const int n2 = e->mirror ? e->band_n * 2 : e->band_n;
+	const float p = ((float)c + 0.5f) / (float)cols * (float)n2;
+	int j = (int)floorf(p);
+	if (j > n2 - 1)
+		j = n2 - 1;
+	const int i = !e->mirror ? j : (j < e->band_n ? e->band_n - 1 - j : j - e->band_n);
+	return e->val[i];
+}
+
+/* layered bars standing on a waterline, with a fainter reflection underneath that ripples */
+static void ew_draw_reflect(struct ew *e, float W, float H, bool linear)
+{
+	const float px = (float)e->px;
+	const float line = ew_snap(H * 0.64f, px);
+	ew_draw_bars(e, W, line, linear);
+
+	const int nb = e->band_n;
+	const int n2 = e->mirror ? nb * 2 : nb;
+	int rows = (int)floorf(line / px);
+	if (rows < 4)
+		rows = 4;
+	const float gp = floorf((float)e->gap / px) * px;
+	const float tt = (float)e->clock;
+	const int max_r = (int)floorf((H - line - px) / px);
+
+	for (int j = 0; j < n2; j++) {
+		const int i = !e->mirror ? j : (j < nb ? nb - 1 - j : j - nb);
+		const float x = ew_snap((float)j * W / (float)n2, px);
+		const float w = ew_snap((float)(j + 1) * W / (float)n2, px) - x - gp;
+		if (w <= 0.0f)
+			continue;
+		int n = (int)roundf(e->val[i] * (float)(rows - 2));
+		if (n < 1)
+			n = e->baseline ? 1 : 0;
+		int depth = (int)roundf((float)n * 0.6f);
+		if (depth > max_r)
+			depth = max_r;
+		for (int r = 0; r < depth; r++) {
+			if (r % 2 == 1)
+				continue;
+			const float f = (float)r / (float)(depth > 1 ? depth : 1);
+			const float shift =
+				roundf(sinf((float)r * 0.9f - tt * 6.0f + (float)j * 0.35f) * (1.0f + f * 2.0f)) * px *
+				0.5f;
+			const float t = (float)r / (float)(n > 1 ? n : 1);
+			ew_rect(e, x + shift, line + px + (float)r * px, w, px,
+				ew_color(e, t, 0.5f * (1.0f - f), linear));
+		}
+	}
+}
+
+/* a row of buildings: heights follow the music, windows light up as it gets louder */
+static void ew_draw_skyline(struct ew *e, float W, float H, bool linear)
+{
+	const float px = (float)e->px;
+	const float vis = ew_presence(e);
+	if (vis < 0.01f)
+		return;
+	const float base_w = px * 12.0f;
+	const uint32_t edge = ew_color(e, 0.0f, vis, linear);
+	const uint32_t body = ew_color(e, 1.0f, 0.14f * vis, linear);
+	const int slot = (int)floorf((float)e->clock * 1.4f); /* windows flicker on and off a little */
+	float x = 0.0f;
+
+	for (int b = 0; x < W; b++) {
+		static const float widths[4] = {0.75f, 1.0f, 1.3f, 1.65f};
+		float bw = ew_snap(base_w * widths[(int)(ew_rand3(b, 1, 7) * 4.0f) & 3], px);
+		if (bw < px * 4.0f)
+			bw = px * 4.0f;
+		if (x + bw > W)
+			bw = W - x;
+		const int cols = (int)floorf(W / bw) > 0 ? (int)floorf(W / bw) : 1;
+		const int c_mid = (int)((x + bw * 0.5f) / W * (float)cols);
+		const float v = ew_col_level(e, c_mid, cols);
+		const float h = ew_snap((0.12f + 0.85f * v) * (H - px * 6.0f) * vis, px);
+		if (h >= px * 3.0f) {
+			const float top = H - h;
+			const float x0 = x, x1 = x + bw - px; /* one pixel of street between buildings */
+			ew_rect(e, x0, top, x1 - x0, h, body);
+			ew_rect(e, x0, top, x1 - x0, px, edge); /* roof */
+			ew_rect(e, x0, top, px, h, edge);       /* walls */
+			ew_rect(e, x1 - px, top, px, h, edge);
+			if (ew_rand3(b, 2, 9) < 0.35f) /* antenna */
+				ew_rect(e, ew_snap((x0 + x1) * 0.5f, px), top - px * 4.0f, px, px * 4.0f, edge);
+
+			/* windows: px wide, px+px tall, on a 2px x 3px grid, lit from the ground up */
+			const float wx0 = x0 + px * 2.0f, wy0 = top + px * 2.0f;
+			const int wcols = (int)floorf((x1 - px * 2.0f - wx0) / (px * 2.0f));
+			const int wrows = (int)floorf((H - px - wy0) / (px * 3.0f));
+			for (int wr = 0; wr < wrows; wr++) {
+				const float from_ground = 1.0f - (float)wr / (float)(wrows > 1 ? wrows : 1);
+				for (int wc = 0; wc < wcols; wc++) {
+					const float k =
+						ew_rand3(b * 131 + wc, wr, slot + (int)(ew_rand3(b, wc, wr) * 3.0f));
+					if (k < v * 1.25f - (1.0f - from_ground) * 0.35f)
+						ew_rect(e, wx0 + (float)wc * px * 2.0f, wy0 + (float)wr * px * 3.0f, px,
+							px * 2.0f,
+							ew_color(e, ew_rand3(b, wc, wr + 50) * 0.8f, vis, linear));
+				}
+			}
+		}
+		x += bw;
+	}
+}
+
+/* spectrum columns of Japanese characters: light kana at the tips, dense kanji lower down (from zig~zag) */
+static void ew_draw_kana(struct ew *e, float W, float H, bool linear)
+{
+	float u = roundf((float)e->font / 16.0f);
+	if (u < 1.0f)
+		u = 1.0f;
+	const float cell = u * 17.0f;
+	const int cols = (int)floorf(W / cell);
+	const int rows = (int)floorf(H / cell);
+	const float vis = ew_presence(e);
+	if (cols < 1 || rows < 1 || vis < 0.01f)
+		return;
+	const float x_off = floorf((W - (float)cols * cell) * 0.5f);
+	const int slot = (int)floorf((float)e->clock / 0.11f);
+
+	for (int c = 0; c < cols; c++) {
+		const float v = ew_col_level(e, c, cols);
+		const float h = powf(v, 1.3f) * (float)rows * 1.1f * (1.0f + e->beat * 0.2f) * vis;
+		for (int rb = 0; rb < rows && (float)rb < h; rb++) {
+			const float from_top = h - (float)rb;
+			const float dens = ew_clamp01(from_top / 7.0f) * (0.4f + 0.6f * v);
+			int g = (int)floorf(dens * 15.0f);
+			const float flick = ew_rand3(c, rb, slot);
+			g += flick > 0.7f ? 1 : (flick < 0.3f ? -1 : 0);
+			if (g < 0)
+				g = 0;
+			if (g > KG_KANA - 1)
+				g = KG_KANA - 1;
+			const float t = (float)rb / (float)(rows > 1 ? rows - 1 : 1);
+			const uint32_t col = from_top < 1.0f ? ew_color(e, 0.0f, vis, linear)
+							     : ew_color(e, t, (0.55f + 0.45f * dens) * vis, linear);
+			ew_kglyph(e, g, x_off + (float)c * cell, H - (float)(rb + 1) * cell, u, col);
+		}
+	}
+}
+
+/* Matrix rain: drops of katakana and digits, thicker and faster when the music is louder */
+static void ew_draw_rain(struct ew *e, float W, float H, bool linear)
+{
+	float u = roundf((float)e->font / 16.0f);
+	if (u < 1.0f)
+		u = 1.0f;
+	const float cell = u * 17.0f;
+	const int cols = (int)floorf(W / cell);
+	const int rows = (int)floorf(H / cell);
+	const float vis = ew_presence(e);
+	if (cols < 1 || rows < 1 || vis < 0.01f)
+		return;
+	const float x_off = floorf((W - (float)cols * cell) * 0.5f);
+	const float top = H - (float)rows * cell;
+	static const int pool[] = {2, 4, 5, 7, 8, 9, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28};
+	const int pool_n = (int)(sizeof(pool) / sizeof(pool[0]));
+
+	for (int c = 0; c < cols; c++) {
+		const float v = ew_col_level(e, c, cols);
+		for (int k = 0; k < 2; k++) {
+			const float rnd = ew_rand3(c, k, 3);
+			const float sp = 0.6f + rnd * 0.9f;
+			const int len = 4 + (int)(ew_rand3(c, k, 4) * 8.0f);
+			const float span = (float)(rows + len);
+			const float pos = e->rain_t * sp * 6.0f + rnd * span * 3.0f;
+			const int drop = (int)floorf(pos / span);
+			const float head = fmodf(pos, span);
+			/* each drop only falls if its column is loud enough this time round */
+			const float need = ew_rand3(c, k * 977 + drop, 5) * 0.75f;
+			const float show = ew_clamp01((v - need) * 5.0f) * vis;
+			if (show < 0.02f)
+				continue;
+			const int gslot = (int)floorf(e->rain_t * sp * 2.0f);
+			for (int q = 0; q < len; q++) {
+				const int r = (int)floorf(head) - q;
+				if (r < 0 || r >= rows)
+					continue;
+				const float fade = 1.0f - (float)q / (float)len;
+				const int g = pool[(int)(ew_rand3(c * 7 + k, r, gslot + q) * (float)pool_n) % pool_n];
+				const uint32_t col =
+					q == 0 ? ew_color(e, 0.0f, show, linear)
+					       : ew_color(e, 0.25f + 0.75f * (1.0f - fade), fade * show, linear);
+				ew_kglyph(e, g, x_off + (float)c * cell, top + (float)r * cell, u, col);
+			}
+		}
+	}
+}
+
 static void ew_render(void *data, gs_effect_t *effect)
 {
 	UNUSED_PARAMETER(effect);
 	struct ew *e = data;
-	const float W = (float)e->width, H = (float)e->height;
+	float W = (float)e->width;
+	const float H = (float)e->height;
 	const bool linear = gs_get_linear_srgb();
 
 	if (e->band_n <= 0 || W < 1.0f || H < 1.0f)
 		return;
 
 	e->vn = 0;
+	e->ox = 0.0f;
 	if (e->bg_on)
 		ew_rect(e, 0.0f, 0.0f, W, H, ew_plain(e->bg, linear));
+
+	/* Length: draw the same visual into a narrower strip centred in the source */
+	const float full_w = W;
+	W = roundf(full_w * e->length);
+	if (W < 8.0f)
+		W = 8.0f;
+	e->ox = floorf((full_w - W) * 0.5f);
 
 	switch (e->style) {
 	case STYLE_SOLID:
@@ -923,6 +1687,36 @@ static void ew_render(void *data, gs_effect_t *effect)
 		break;
 	case STYLE_ASCII:
 		ew_draw_ascii(e, W, H, linear);
+		break;
+	case STYLE_LED:
+		ew_draw_led(e, W, H, linear);
+		break;
+	case STYLE_RIDGE:
+		ew_draw_ridge(e, W, H, linear);
+		break;
+	case STYLE_PIXWAVE:
+		ew_draw_pixwave(e, W, H, linear);
+		break;
+	case STYLE_CURVE:
+		ew_draw_curve(e, W, H, linear);
+		break;
+	case STYLE_DITHER:
+		ew_draw_dither(e, W, H, linear);
+		break;
+	case STYLE_OCEAN:
+		ew_draw_ocean(e, W, H, linear);
+		break;
+	case STYLE_REFLECT:
+		ew_draw_reflect(e, W, H, linear);
+		break;
+	case STYLE_SKYLINE:
+		ew_draw_skyline(e, W, H, linear);
+		break;
+	case STYLE_KANA:
+		ew_draw_kana(e, W, H, linear);
+		break;
+	case STYLE_RAIN:
+		ew_draw_rain(e, W, H, linear);
 		break;
 	default:
 		ew_draw_bars(e, W, H, linear);
@@ -985,31 +1779,43 @@ static bool ew_style_changed(obs_properties_t *props, obs_property_t *property, 
 {
 	UNUSED_PARAMETER(property);
 	const int style = (int)obs_data_get_int(settings, "style");
-	const bool bars = style == STYLE_BARS || style == STYLE_SOLID || style == STYLE_CENTER;
+	const bool bars = style == STYLE_BARS || style == STYLE_SOLID || style == STYLE_CENTER || style == STYLE_LED ||
+			  style == STYLE_DITHER;
+	const bool spectrum = bars || style == STYLE_RIDGE || style == STYLE_CURVE || style == STYLE_OCEAN ||
+			      style == STYLE_REFLECT || style == STYLE_SKYLINE || style == STYLE_KANA ||
+			      style == STYLE_RAIN;
+	const bool grad_ok = style != STYLE_CENTER && style != STYLE_ASCII;
 	const bool grad = obs_data_get_bool(settings, "gradient");
 
-	ew_show(props, "mirror", style == STYLE_BARS || style == STYLE_SOLID);
-	ew_show(props, "range", bars);
-	ew_show(props, "color2", grad && style != STYLE_CENTER && style != STYLE_ASCII);
-	ew_show(props, "gradient", style != STYLE_CENTER && style != STYLE_ASCII);
-	ew_show(props, "gradient3", grad && style != STYLE_CENTER && style != STYLE_ASCII);
-	ew_show(props, "color3",
-		grad && obs_data_get_bool(settings, "gradient3") && style != STYLE_CENTER && style != STYLE_ASCII);
+	ew_show(props, "mirror", spectrum && style != STYLE_CENTER);
+	ew_show(props, "range", spectrum);
+	ew_show(props, "gradient", grad_ok);
+	ew_show(props, "color2", grad && grad_ok);
+	ew_show(props, "gradient3", grad && grad_ok);
+	ew_show(props, "color3", grad && grad_ok && obs_data_get_bool(settings, "gradient3"));
 	ew_show(props, "bg", obs_data_get_bool(settings, "bg_on"));
-	ew_show(props, "scale", bars);
-	ew_show(props, "smooth", bars || style == STYLE_SINES);
-	ew_show(props, "decay", bars || style == STYLE_SINES);
-	ew_show(props, "bars", bars);
-	ew_show(props, "gap", bars);
-	ew_show(props, "px", style == STYLE_BARS);
-	ew_show(props, "peaks", style == STYLE_BARS || style == STYLE_SOLID);
-	ew_show(props, "baseline", bars);
-	ew_show(props, "layers", style == STYLE_SCOPE);
-	ew_show(props, "font", style == STYLE_ASCII);
+	ew_show(props, "scale", spectrum);
+	ew_show(props, "smooth", spectrum || style == STYLE_SINES);
+	ew_show(props, "decay", spectrum || style == STYLE_SINES);
+	ew_show(props, "bars", spectrum);
+	ew_show(props, "gap", bars || style == STYLE_REFLECT);
+	ew_show(props, "px",
+		style == STYLE_BARS || style == STYLE_LED || style == STYLE_PIXWAVE || style == STYLE_DITHER ||
+			style == STYLE_REFLECT || style == STYLE_SKYLINE);
+	ew_show(props, "peaks",
+		style == STYLE_BARS || style == STYLE_SOLID || style == STYLE_LED || style == STYLE_DITHER ||
+			style == STYLE_REFLECT);
+	ew_show(props, "baseline",
+		bars || style == STYLE_OCEAN || style == STYLE_REFLECT || style == STYLE_SKYLINE ||
+			style == STYLE_KANA || style == STYLE_RAIN);
+	ew_show(props, "layers", style == STYLE_SCOPE || style == STYLE_RIDGE);
+	ew_show(props, "font",
+		style == STYLE_ASCII || style == STYLE_OCEAN || style == STYLE_KANA || style == STYLE_RAIN);
 	ew_show(props, "sine_count", style == STYLE_SINES);
 	ew_show(props, "sine_speed", style == STYLE_SINES);
 	ew_show(props, "sine_thick", style == STYLE_SINES);
 	ew_show(props, "sine_size", style == STYLE_SINES);
+	ew_show(props, "sine_react", style == STYLE_SINES);
 	return true;
 }
 
@@ -1032,6 +1838,16 @@ static obs_properties_t *ew_properties(void *data)
 	obs_property_list_add_int(p, "Sine waves", STYLE_SINES);
 	obs_property_list_add_int(p, "Oscilloscope", STYLE_SCOPE);
 	obs_property_list_add_int(p, "Oscilloscope ASCII", STYLE_ASCII);
+	obs_property_list_add_int(p, "LED meter", STYLE_LED);
+	obs_property_list_add_int(p, "Ridgeline", STYLE_RIDGE);
+	obs_property_list_add_int(p, "Pixel waveform", STYLE_PIXWAVE);
+	obs_property_list_add_int(p, "Spectrum curve", STYLE_CURVE);
+	obs_property_list_add_int(p, "Bars (dither)", STYLE_DITHER);
+	obs_property_list_add_int(p, "Ocean (zig~zag)", STYLE_OCEAN);
+	obs_property_list_add_int(p, "Reflection", STYLE_REFLECT);
+	obs_property_list_add_int(p, "Skyline", STYLE_SKYLINE);
+	obs_property_list_add_int(p, "Kana columns (zig~zag)", STYLE_KANA);
+	obs_property_list_add_int(p, "Matrix rain", STYLE_RAIN);
 	obs_property_set_modified_callback(p, ew_style_changed);
 
 	obs_properties_add_bool(props, "mirror", "Mirror");
@@ -1054,6 +1870,7 @@ static obs_properties_t *ew_properties(void *data)
 
 	obs_properties_add_int(props, "width", "Width", 16, 7680, 1);
 	obs_properties_add_int(props, "height", "Height", 16, 4320, 1);
+	obs_properties_add_float_slider(props, "length", "Length", 0.1, 1.0, 0.01);
 
 	obs_properties_add_float_slider(props, "scale", "Height Scale", 0.1, 1.0, 0.01);
 	obs_properties_add_float_slider(props, "sens", "Sensitivity", 0.1, 3.0, 0.01);
@@ -1068,12 +1885,13 @@ static obs_properties_t *ew_properties(void *data)
 	obs_properties_add_bool(props, "baseline", "Show Baseline When Silent");
 
 	obs_properties_add_int_slider(props, "layers", "Scope Layers", 1, 12, 1);
-	obs_properties_add_int_slider(props, "font", "ASCII Size", 8, 48, 1);
+	obs_properties_add_int_slider(props, "font", "Character Size", 8, 48, 1);
 
 	obs_properties_add_int_slider(props, "sine_count", "Waves", 1, 12, 1);
 	obs_properties_add_float_slider(props, "sine_speed", "Wave Speed", 0.0, 4.0, 0.05);
 	obs_properties_add_int_slider(props, "sine_thick", "Wave Thickness", 1, 8, 1);
 	obs_properties_add_float_slider(props, "sine_size", "Wave Size", 0.2, 3.0, 0.05);
+	obs_properties_add_float_slider(props, "sine_react", "Wave Reactivity", 0.0, 3.0, 0.05);
 
 	return props;
 }
@@ -1114,6 +1932,8 @@ static void ew_defaults(obs_data_t *s)
 	obs_data_set_default_double(s, "sine_speed", 1.0);
 	obs_data_set_default_int(s, "sine_thick", 2);
 	obs_data_set_default_double(s, "sine_size", 1.0);
+	obs_data_set_default_double(s, "sine_react", 1.5);
+	obs_data_set_default_double(s, "length", 1.0);
 }
 
 static int ew_clampi(long long v, int lo, int hi)
@@ -1149,7 +1969,7 @@ static void ew_update(void *data, obs_data_t *s)
 	}
 
 	const int old_style = e->style;
-	e->style = ew_clampi(obs_data_get_int(s, "style"), STYLE_BARS, STYLE_ASCII);
+	e->style = ew_clampi(obs_data_get_int(s, "style"), STYLE_BARS, STYLE_LAST);
 	if (e->style != old_style)
 		e->hist_count = 0; /* past snapshots belong to the old style */
 	e->trails = ew_clampf(obs_data_get_double(s, "trails"), 0.0f, 1.0f);
@@ -1179,6 +1999,8 @@ static void ew_update(void *data, obs_data_t *s)
 	e->sine_speed = ew_clampf(obs_data_get_double(s, "sine_speed"), 0.0f, 4.0f);
 	e->sine_thick = ew_clampi(obs_data_get_int(s, "sine_thick"), 1, 8);
 	e->sine_size = ew_clampf(obs_data_get_double(s, "sine_size"), 0.2f, 3.0f);
+	e->sine_react = ew_clampf(obs_data_get_double(s, "sine_react"), 0.0f, 3.0f);
+	e->length = ew_clampf(obs_data_get_double(s, "length"), 0.1f, 1.0f);
 }
 
 /* ---------------------------------------------------------------- plumbing */
